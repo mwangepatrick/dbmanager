@@ -1,0 +1,54 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+
+# Developer settings
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Auto-generated files
+GeneratedFiles/
+logs/
+[Ll]og/
+[Ll]ogs/
+vssver.scc
+.nfproj
+.project
+.csproj.user
+.vscode
+
+# Others
+*.cache
+*.pdb
+*.mdb
+*.opendb
+*.pidb
+*.ide
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+[_Rr]each/Build/
+aspnet_client
+*.publishsettings
+.vscode/
+.idea/
+node_modules/
+
+# Uncomment if using Heroku
+# .heroku
+
+# Ignore MacOS specific files
+.DS_Store
+
+# Ignore Windows specific files
+Thumbs.db
+ehthumbs.db
