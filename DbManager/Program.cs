@@ -16,6 +16,7 @@ namespace DbManager
     {
         public class DbConfig
         {
+            public string Name { get; set; }
             public string Server { get; set; }
             public string Database { get; set; }
             public string UserId { get; set; }
@@ -27,51 +28,12 @@ namespace DbManager
         private static readonly byte[] key = Encoding.UTF8.GetBytes("Ade87hjdw78sA9kfjT6fjEm2XcPQre01");
         private static readonly byte[] iv = Encoding.UTF8.GetBytes("Uj8mNp7dOw4rIyB2");
 
-        public static DbConfig GetOrCreateDbConfig(bool rst = false)
+        private static string GetConfigPath()
         {
             var commonPath = "dbswap";
             if (!Directory.Exists(commonPath)) Directory.CreateDirectory(commonPath);
-            var jsonConfigPath = Path.Combine(commonPath, "dbConfig.json");
-            DbConfig config;
-
-            if (!rst && File.Exists(jsonConfigPath))
-            {
-                var encryptedJson = File.ReadAllText(jsonConfigPath);
-                var decryptedJson = DecryptString(encryptedJson);
-                config = JsonConvert.DeserializeObject<DbConfig>(decryptedJson);
-            }
-            else
-            {
-                config = new DbConfig();
-                Console.Write("Enter the server name: ");
-                config.Server = Console.ReadLine();
-                Console.Write("Enter the database name: ");
-                config.Database = Console.ReadLine();
-                Console.Write("Enter the user ID: ");
-                config.UserId = Console.ReadLine();
-                Console.Write("Enter the password: ");
-                config.Password = Console.ReadLine();
-
-                // Prompt for port
-                Console.Write("Enter the port (leave empty for default 5432): ");
-                var portInput = Console.ReadLine();
-                if (int.TryParse(portInput, out int port))
-                {
-                    config.Port = port;
-                }
-                else
-                {
-                    config.Port = 5432;
-                }
-
-                var json = JsonConvert.SerializeObject(config, Formatting.Indented);
-                var encryptedJson = EncryptString(json);
-                File.WriteAllText(jsonConfigPath, encryptedJson);
-            }
-
-            return config;
+            return Path.Combine(commonPath, "dbConfig.json");
         }
-
 
         private static string EncryptString(string plainText)
         {
@@ -115,64 +77,278 @@ namespace DbManager
             }
         }
 
-        static void Main(string[] args)
+        public static List<DbConfig> LoadConfigs()
         {
+            var path = GetConfigPath();
+            if (!File.Exists(path)) return new List<DbConfig>();
 
-            DbConfig config = GetOrCreateDbConfig();
+            try
+            {
+                var encryptedJson = File.ReadAllText(path);
+                var decryptedJson = DecryptString(encryptedJson);
 
-            string connectionString =
-                $"Server={config.Server};Database={config.Database};User Id={config.UserId};Password={config.Password};Port={config.Port};Timeout=30;";
-            NpgsqlConnection connection = new NpgsqlConnection(connectionString);
+                try
+                {
+                    var configs = JsonConvert.DeserializeObject<List<DbConfig>>(decryptedJson);
+                    if (configs != null) return configs;
+                }
+                catch
+                {
+                    // Migration: try to load as single config
+                    var singleConfig = JsonConvert.DeserializeObject<DbConfig>(decryptedJson);
+                    if (singleConfig != null)
+                    {
+                        if (string.IsNullOrEmpty(singleConfig.Name)) singleConfig.Name = "Default";
+                        return new List<DbConfig> { singleConfig };
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading configurations: {ex.Message}");
+            }
+            return new List<DbConfig>();
+        }
 
+        public static void SaveConfigs(List<DbConfig> configs)
+        {
+            var path = GetConfigPath();
+            var json = JsonConvert.SerializeObject(configs, Formatting.Indented);
+            var encryptedJson = EncryptString(json);
+            File.WriteAllText(path, encryptedJson);
+        }
+
+        public static bool TestConnection(DbConfig config)
+        {
+            string connString = $"Server={config.Server};Database={config.Database};User Id={config.UserId};Password={config.Password};Port={config.Port};Timeout=10;";
+            try
+            {
+                using (var conn = new NpgsqlConnection(connString))
+                {
+                    conn.Open();
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\nConnection failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        public static DbConfig PromptForConfig(DbConfig existing = null)
+        {
+            var config = new DbConfig();
+            if (existing != null)
+            {
+                config.Name = existing.Name;
+                config.Server = existing.Server;
+                config.Database = existing.Database;
+                config.UserId = existing.UserId;
+                config.Password = existing.Password;
+                config.Port = existing.Port;
+            }
+            else
+            {
+                config.Port = 5432;
+                config.Database = "postgres";
+            }
+
+            Console.WriteLine(existing == null ? "\n--- Add New Connection ---" : "\n--- Edit Connection ---");
+
+            Console.Write($"Enter connection name [{(existing?.Name ?? "New Connection")}]: ");
+            var name = Console.ReadLine();
+            if (!string.IsNullOrEmpty(name)) config.Name = name;
+            else if (existing == null) config.Name = "New Connection";
+
+            Console.Write($"Enter server [{(existing?.Server ?? "")}]: ");
+            var server = Console.ReadLine();
+            if (!string.IsNullOrEmpty(server)) config.Server = server;
+
+            Console.Write($"Enter database [{(existing?.Database ?? "postgres")}]: ");
+            var db = Console.ReadLine();
+            if (!string.IsNullOrEmpty(db)) config.Database = db;
+
+            Console.Write($"Enter user ID [{(existing?.UserId ?? "postgres")}]: ");
+            var user = Console.ReadLine();
+            if (!string.IsNullOrEmpty(user)) config.UserId = user;
+
+            Console.Write($"Enter password [{(existing?.Password != null ? "****" : "")}]: ");
+            var pass = Console.ReadLine();
+            if (!string.IsNullOrEmpty(pass)) config.Password = pass;
+
+            Console.Write($"Enter port [{(existing?.Port.ToString() ?? "5432")}]: ");
+            var portInput = Console.ReadLine();
+            if (int.TryParse(portInput, out int port)) config.Port = port;
+
+            Console.WriteLine("Testing connection...");
+            if (TestConnection(config))
+            {
+                Console.WriteLine("Connection test passed!");
+                return config;
+            }
+            else
+            {
+                Console.Write("Connection test failed. Save anyway? (y/n): ");
+                if (Console.ReadLine()?.ToLower() == "y") return config;
+            }
+            return null;
+        }
+
+        public static DbConfig SelectOrManageConfigs()
+        {
             while (true)
             {
-                Console.WriteLine("\nChoose a task:");
-                Console.WriteLine("1. Delete database");
-                Console.WriteLine("2. Access database");
-                Console.WriteLine("3. Rename database");
-                Console.WriteLine("4. Backup database");
-                Console.WriteLine("5. Import new database");
-                Console.WriteLine("6. Change database settings");
-                Console.WriteLine("7. Exit");
-                Console.Write("Enter your choice: ");
-
-                string choice = Console.ReadLine();
-                switch (choice)
+                var configs = LoadConfigs();
+                Console.WriteLine("\n==============================");
+                Console.WriteLine("   DATABASE CONNECTION MANAGER");
+                Console.WriteLine("==============================");
+                
+                if (configs.Count == 0)
                 {
-                    case "1":
-                        DeleteDatabase(connection, config);
-                        break;
-                    case "2":
-                        AccessDatabase(config);
-                        break;
-                    case "3":
-                        Console.Write("Enter the current database name: ");
-                        string currentDatabaseName = Console.ReadLine();
+                    Console.WriteLine("No connections saved.");
+                }
+                else
+                {
+                    for (int i = 0; i < configs.Count; i++)
+                    {
+                        Console.WriteLine($"{i + 1}. [{configs[i].Name}] {configs[i].Server}:{configs[i].Port} ({configs[i].Database})");
+                    }
+                }
+                Console.WriteLine("------------------------------");
+                Console.WriteLine("A. Add new connection");
+                if (configs.Count > 0)
+                {
+                    Console.WriteLine("E. Edit a connection");
+                    Console.WriteLine("D. Delete a connection");
+                }
+                Console.WriteLine("X. Exit");
+                Console.Write("\nChoose a connection number or an option: ");
 
-                        Console.Write("Enter the new name for the database: ");
-                        string newDatabaseName = Console.ReadLine();
+                string choice = Console.ReadLine()?.ToUpper();
 
-                        RenameDatabase(connection, config, currentDatabaseName, newDatabaseName);
+                if (choice == "A")
+                {
+                    var newConfig = PromptForConfig();
+                    if (newConfig != null)
+                    {
+                        configs.Add(newConfig);
+                        SaveConfigs(configs);
+                        Console.WriteLine("Connection added successfully.");
+                    }
+                }
+                else if (choice == "E" && configs.Count > 0)
+                {
+                    Console.Write("Enter the number to edit: ");
+                    if (int.TryParse(Console.ReadLine(), out int index) && index > 0 && index <= configs.Count)
+                    {
+                        var updated = PromptForConfig(configs[index - 1]);
+                        if (updated != null)
+                        {
+                            configs[index - 1] = updated;
+                            SaveConfigs(configs);
+                            Console.WriteLine("Connection updated successfully.");
+                        }
+                    }
+                }
+                else if (choice == "D" && configs.Count > 0)
+                {
+                    Console.Write("Enter the number to delete: ");
+                    if (int.TryParse(Console.ReadLine(), out int index) && index > 0 && index <= configs.Count)
+                    {
+                        Console.Write($"Are you sure you want to delete '{configs[index-1].Name}'? (y/n): ");
+                        if (Console.ReadLine()?.ToLower() == "y")
+                        {
+                            configs.RemoveAt(index - 1);
+                            SaveConfigs(configs);
+                            Console.WriteLine("Connection deleted.");
+                        }
+                    }
+                }
+                else if (choice == "X")
+                {
+                    Environment.Exit(0);
+                }
+                else if (int.TryParse(choice, out int selIndex) && selIndex > 0 && selIndex <= configs.Count)
+                {
+                    var selected = configs[selIndex - 1];
+                    Console.WriteLine($"\nConnecting to '{selected.Name}'...");
+                    if (TestConnection(selected))
+                    {
+                        Console.WriteLine("Successfully connected!");
+                        return selected;
+                    }
+                    else
+                    {
+                        Console.WriteLine("Could not connect. Please check settings or server status.");
+                        Console.WriteLine("Press any key to return to menu...");
+                        Console.ReadKey();
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Invalid choice. Try again.");
+                }
+            }
+        }
 
-                        break;
-                    case "4":
-                        BackupDatabase(config);
-                        break;
-                    case "5":
-                        ImportNewDatabase(connection, config);
-                        break;
-                    case "6":
-                        config = GetOrCreateDbConfig(true);
+        static void Main(string[] args)
+        {
+            while (true)
+            {
+                DbConfig config = SelectOrManageConfigs();
 
-                        connectionString =
-                            $"Server={config.Server};Database={config.Database};User Id={config.UserId};Password={config.Password};Port={config.Port}";
-                        connection.ConnectionString = connectionString;
-                        break;
-                    case "7":
-                        return;
-                    default:
-                        Console.WriteLine("Invalid choice. Please try again.");
-                        break;
+                string connectionString =
+                    $"Server={config.Server};Database={config.Database};User Id={config.UserId};Password={config.Password};Port={config.Port};Timeout=30;";
+                NpgsqlConnection connection = new NpgsqlConnection(connectionString);
+
+                bool backToConnections = false;
+                while (!backToConnections)
+                {
+                    Console.WriteLine($"\n--- [{config.Name}] Active Connection ---");
+                    Console.WriteLine("1. Delete database");
+                    Console.WriteLine("2. Access database (psql)");
+                    Console.WriteLine("3. Rename database");
+                    Console.WriteLine("4. Backup database");
+                    Console.WriteLine("5. Import new database");
+                    Console.WriteLine("6. Switch / Manage connections");
+                    Console.WriteLine("7. Exit");
+                    Console.Write("Enter your choice: ");
+
+                    string choice = Console.ReadLine();
+                    switch (choice)
+                    {
+                        case "1":
+                            DeleteDatabase(connection, config);
+                            break;
+                        case "2":
+                            AccessDatabase(config);
+                            break;
+                        case "3":
+                            Console.Write("Enter the current database name: ");
+                            string currentDatabaseName = Console.ReadLine();
+
+                            Console.Write("Enter the new name for the database: ");
+                            string newDatabaseName = Console.ReadLine();
+
+                            RenameDatabase(connection, config, currentDatabaseName, newDatabaseName);
+
+                            break;
+                        case "4":
+                            BackupDatabase(config);
+                            break;
+                        case "5":
+                            ImportNewDatabase(connection, config);
+                            break;
+                        case "6":
+                            backToConnections = true;
+                            break;
+                        case "7":
+                            return;
+                        default:
+                            Console.WriteLine("Invalid choice. Please try again.");
+                            break;
+                    }
                 }
             }
         }
