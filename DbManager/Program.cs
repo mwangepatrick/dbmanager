@@ -30,9 +30,28 @@ namespace DbManager
 
         private static string GetConfigPath()
         {
-            var commonPath = "dbswap";
+            var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var commonPath = Path.Combine(appDataPath, "DbManager");
             if (!Directory.Exists(commonPath)) Directory.CreateDirectory(commonPath);
-            return Path.Combine(commonPath, "dbConfig.json");
+
+            var newPath = Path.Combine(commonPath, "dbConfig.json");
+
+            // Migration logic: move from old local 'dbswap' folder if it exists
+            var oldPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dbswap", "dbConfig.json");
+            if (File.Exists(oldPath) && !File.Exists(newPath))
+            {
+                try
+                {
+                    File.Copy(oldPath, newPath);
+                    Console.WriteLine("Migrated configuration to AppData.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to migrate config: {ex.Message}");
+                }
+            }
+
+            return newPath;
         }
 
         private static string EncryptString(string plainText)
@@ -306,27 +325,32 @@ namespace DbManager
                 while (!backToConnections)
                 {
                     Console.WriteLine($"\n--- [{config.Name}] Active Connection ---");
-                    Console.WriteLine("1. Delete database");
-                    Console.WriteLine("2. Access database (psql)");
-                    Console.WriteLine("3. Rename database");
-                    Console.WriteLine("4. Backup database");
-                    Console.WriteLine("5. Import new database");
-                    Console.WriteLine("6. Switch / Manage connections");
-                    Console.WriteLine("7. Exit");
+                    Console.WriteLine("1. Show databases");
+                    Console.WriteLine("2. Delete database");
+                    Console.WriteLine("3. Access database (psql)");
+                    Console.WriteLine("4. Rename database");
+                    Console.WriteLine("5. Backup database");
+                    Console.WriteLine("6. Import new database");
+                    Console.WriteLine("7. Go back to main menu");
+                    Console.WriteLine("8. Exit");
                     Console.Write("Enter your choice: ");
 
                     string choice = Console.ReadLine();
                     switch (choice)
                     {
                         case "1":
-                            DeleteDatabase(connection, config);
+                            ShowDatabases(config);
                             break;
                         case "2":
-                            AccessDatabase(config);
+                            DeleteDatabase(connection, config);
                             break;
                         case "3":
-                            Console.Write("Enter the current database name: ");
+                            AccessDatabase(config);
+                            break;
+                        case "4":
+                            Console.Write($"Enter the current database name [{config.Database}]: ");
                             string currentDatabaseName = Console.ReadLine();
+                            if (string.IsNullOrEmpty(currentDatabaseName)) currentDatabaseName = config.Database;
 
                             Console.Write("Enter the new name for the database: ");
                             string newDatabaseName = Console.ReadLine();
@@ -334,16 +358,16 @@ namespace DbManager
                             RenameDatabase(connection, config, currentDatabaseName, newDatabaseName);
 
                             break;
-                        case "4":
+                        case "5":
                             BackupDatabase(config);
                             break;
-                        case "5":
+                        case "6":
                             ImportNewDatabase(connection, config);
                             break;
-                        case "6":
+                        case "7":
                             backToConnections = true;
                             break;
-                        case "7":
+                        case "8":
                             return;
                         default:
                             Console.WriteLine("Invalid choice. Please try again.");
@@ -353,12 +377,57 @@ namespace DbManager
             }
         }
 
+        public static List<string> GetDatabases(DbConfig config)
+        {
+            List<string> databases = new List<string>();
+            try
+            {
+                string connString = $"Server={config.Server};Port={config.Port};Database=postgres;User Id={config.UserId};Password={config.Password};Timeout=10;";
+                using (var conn = new NpgsqlConnection(connString))
+                {
+                    conn.Open();
+                    string sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;";
+                    using (var cmd = new NpgsqlCommand(sql, conn))
+                    {
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                databases.Add(reader.GetString(0));
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error listing databases: {ex.Message}");
+            }
+            return databases;
+        }
+
+        public static void ShowDatabases(DbConfig config)
+        {
+            var databases = GetDatabases(config);
+            Console.WriteLine("\nAvailable databases:");
+            for (int i = 0; i < databases.Count; i++)
+            {
+                Console.WriteLine($"{i + 1}: {databases[i]}");
+            }
+            Console.WriteLine("0: Go back to main menu");
+            Console.WriteLine("\nPress any key to return...");
+            Console.ReadKey();
+        }
+
         public static void AccessDatabase(DbConfig config)
         {
-            Console.Write("Enter the name of the database to access: ");
+            Console.Write($"Enter the name of the database to access [{config.Database}]: ");
             string dbName = Console.ReadLine();
 
-            config.Database = dbName;
+            if (!string.IsNullOrEmpty(dbName))
+            {
+                config.Database = dbName;
+            }
 
             try
             {
@@ -390,40 +459,27 @@ namespace DbManager
         {
             try
             {
-                string listDatabasesConnectionString =
-                    $"Server={config.Server};Database=postgres;User Id={config.UserId};Password={config.Password};";
-                using (var listDatabasesConnection = new NpgsqlConnection(listDatabasesConnectionString))
+                var databases = GetDatabases(config);
+
+                Console.WriteLine("\nAvailable databases:");
+                for (int i = 0; i < databases.Count; i++)
                 {
-                    listDatabasesConnection.Open();
-                    string listDatabasesSql = "SELECT datname FROM pg_database WHERE datistemplate = false;";
-                    using (var command = new NpgsqlCommand(listDatabasesSql, listDatabasesConnection))
-                    {
-                        using (var reader = command.ExecuteReader())
-                        {
-                            List<string> databases = new List<string>();
-                            while (reader.Read())
-                            {
-                                databases.Add(reader.GetString(0));
-                            }
-
-                            Console.WriteLine("Available databases:");
-                            for (int i = 0; i < databases.Count; i++)
-                            {
-                                Console.WriteLine($"{i + 1}: {databases[i]}");
-                            }
-
-                            Console.Write("Enter the number of the database you want to delete: ");
-                            if (!int.TryParse(Console.ReadLine(), out int choice) || choice < 1 || choice > databases.Count)
-                            {
-                                Console.WriteLine("Invalid choice. Operation canceled.");
-                                return;
-                            }
-
-                            config.Database = databases[choice - 1];
-                            Console.WriteLine($"You have selected to delete the database '{config.Database}'.");
-                        }
-                    }
+                    Console.WriteLine($"{i + 1}: {databases[i]}");
                 }
+                Console.WriteLine("0: Go back to main menu");
+
+                Console.Write("Enter the number of the database you want to delete: ");
+                string input = Console.ReadLine();
+                if (input == "0") return;
+
+                if (!int.TryParse(input, out int choice) || choice < 1 || choice > databases.Count)
+                {
+                    Console.WriteLine("Invalid choice. Operation canceled.");
+                    return;
+                }
+
+                config.Database = databases[choice - 1];
+                Console.WriteLine($"You have selected to delete the database '{config.Database}'.");
 
                 Console.Write(
                     $"Are you sure you want to delete the database '{config.Database}'? This action cannot be undone (yes/no): ");
@@ -642,72 +698,85 @@ namespace DbManager
 
         public static void BackupDatabase(DbConfig config)
         {
+            string backupFilePath = null;
             try
             {
-                Console.Write("Enter the name of the database to backup: ");
+                Console.Write($"Enter the name of the database to backup [{config.Database}]: ");
                 string dbName = Console.ReadLine();
-                Console.WriteLine($"Database name: {dbName}");
+                if (string.IsNullOrWhiteSpace(dbName))
+                {
+                    dbName = config.Database;
+                }
+
+                if (string.IsNullOrWhiteSpace(dbName))
+                {
+                    Console.WriteLine("Error: Database name cannot be empty. Backup canceled.");
+                    return;
+                }
 
                 string timestamp = DateTime.Now.ToString("yyMMddHHmmss");
                 string backupFileName = $"{dbName}_{timestamp}.backup";
-                Console.WriteLine($"Backup file name: {backupFileName}");
 
                 string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-                string backupsFolderPath = Path.Combine(desktopPath, "backups");
-                Console.WriteLine($"Backups folder path: {backupsFolderPath}");
+                
+                // Sanitize connection name for folder use
+                string safeConfigName = string.Join("_", config.Name.Split(Path.GetInvalidFileNameChars()));
+                string backupsFolderPath = Path.Combine(desktopPath, "backups", safeConfigName);
 
                 if (!Directory.Exists(backupsFolderPath))
                 {
                     Directory.CreateDirectory(backupsFolderPath);
-                    Console.WriteLine("Created 'backups' folder on desktop.");
-                }
-                else
-                {
-                    Console.WriteLine("'backups' folder already exists on desktop.");
+                    Console.WriteLine($"Created backup folder: {backupsFolderPath}");
                 }
 
-                string backupFilePath = Path.Combine(backupsFolderPath, backupFileName);
-                Console.WriteLine($"Backup file path: {backupFilePath}");
+                backupFilePath = Path.Combine(backupsFolderPath, backupFileName);
+                Console.WriteLine($"Target backup file: {backupFilePath}");
 
-                Environment.SetEnvironmentVariable("PGPASSWORD", config.Password);
-                Console.WriteLine("Environment variable PGPASSWORD set.");
-
-                string dumpCommand = $"pg_dump -h {config.Server} -U {config.UserId} -p {config.Port} -F c -b -v -f \"{backupFilePath}\" {dbName}";
-                Console.WriteLine($"Dump command: {dumpCommand}");
-
-                ProcessStartInfo procStartInfo = new ProcessStartInfo("cmd", "/c " + dumpCommand)
+                string dumpArguments = $"-h {config.Server} -U {config.UserId} -p {config.Port} -F c -b -v -f \"{backupFilePath}\" \"{dbName}\"";
+                
+                ProcessStartInfo procStartInfo = new ProcessStartInfo("pg_dump", dumpArguments)
                 {
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
                 };
+                procStartInfo.EnvironmentVariables["PGPASSWORD"] = config.Password;
 
                 Console.WriteLine("Starting the backup process...");
                 using (var proc = new Process {StartInfo = procStartInfo})
                 {
                     proc.OutputDataReceived += (sender, data) =>
                     {
-                        if (!string.IsNullOrEmpty(data.Data)) Console.WriteLine($"[Output] {data.Data}");
+                        if (!string.IsNullOrEmpty(data.Data)) Console.WriteLine(data.Data);
                     };
                     proc.ErrorDataReceived += (sender, data) =>
                     {
-                        if (!string.IsNullOrEmpty(data.Data)) Console.WriteLine($"[Error] {data.Data}");
+                        // pg_dump -v sends verbose info to stderr; we log it without [Error] prefix
+                        if (!string.IsNullOrEmpty(data.Data)) Console.WriteLine(data.Data);
                     };
                     proc.Start();
                     proc.BeginOutputReadLine();
                     proc.BeginErrorReadLine();
                     proc.WaitForExit();
-                    Console.WriteLine($"Process exited with code: {proc.ExitCode}");
+                    
+                    if (proc.ExitCode == 0)
+                    {
+                        Console.WriteLine($"\nBackup successful! Saved to: {backupFilePath}");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"\nBackup failed with exit code: {proc.ExitCode}");
+                    }
                 }
-                Environment.SetEnvironmentVariable("PGPASSWORD", null);
-                Console.WriteLine("Environment variable PGPASSWORD cleared.");
-
-                Console.WriteLine($"Backup successful! File saved as: {backupFilePath}");
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                Console.WriteLine("Backup failed: 'pg_dump' was not found. Install PostgreSQL client tools and add the bin folder to PATH.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"An error occurred during backup: {ex.Message}\n{ex.StackTrace}");
+                Console.WriteLine($"An error occurred during backup: {ex.Message}");
             }
         }
 
