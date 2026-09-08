@@ -24,6 +24,24 @@ namespace DbManager
             public int Port { get; set; }
         }
 
+        private class SireSetup
+        {
+            public string SourceDatabase { get; set; }
+            public string NewDatabaseName { get; set; }
+            public string BranchName { get; set; }
+            public string BranchNumber { get; set; }
+            public string MpesaTillNumber { get; set; }
+            public int NumberOfTills { get; set; }
+            public List<string> TablesToClean { get; set; } = new List<string>();
+        }
+
+        private class TableInfo
+        {
+            public string Schema { get; set; }
+            public string Name { get; set; }
+            public long RowCount { get; set; }
+        }
+
 
         private static readonly byte[] key = Encoding.UTF8.GetBytes("Ade87hjdw78sA9kfjT6fjEm2XcPQre01");
         private static readonly byte[] iv = Encoding.UTF8.GetBytes("Uj8mNp7dOw4rIyB2");
@@ -331,11 +349,15 @@ namespace DbManager
                     Console.WriteLine("4. Rename database");
                     Console.WriteLine("5. Backup database");
                     Console.WriteLine("6. Import new database");
-                    Console.WriteLine("7. Go back to main menu");
-                    Console.WriteLine("8. Exit");
+                    Console.WriteLine("7. [Pawa] Sire - clone sample database");
+                    Console.WriteLine("8. [Pawa] Transaction reset");
+                    Console.WriteLine("9. [Pawa] VACUUM/FREEZE/ANALYZE");
+                    Console.WriteLine("10. [Pawa] Show table row counts");
+                    Console.WriteLine("11. Go back to main menu");
+                    Console.WriteLine("X. Exit");
                     Console.Write("Enter your choice: ");
 
-                    string choice = Console.ReadLine();
+                    string choice = Console.ReadLine()?.Trim().ToUpperInvariant();
                     switch (choice)
                     {
                         case "1":
@@ -365,9 +387,21 @@ namespace DbManager
                             ImportNewDatabase(connection, config);
                             break;
                         case "7":
-                            backToConnections = true;
+                            PawaSire(config);
                             break;
                         case "8":
+                            TransactionReset(config);
+                            break;
+                        case "9":
+                            VacuumAnalyze(config);
+                            break;
+                        case "10":
+                            ShowTableRowCounts(config);
+                            break;
+                        case "11":
+                            backToConnections = true;
+                            break;
+                        case "X":
                             return;
                         default:
                             Console.WriteLine("Invalid choice. Please try again.");
@@ -375,6 +409,697 @@ namespace DbManager
                     }
                 }
             }
+        }
+
+        private static string QuoteIdentifier(string value)
+        {
+            return "\"" + value.Replace("\"", "\"\"") + "\"";
+        }
+
+        private static string BuildConnectionString(DbConfig config, string database)
+        {
+            return $"Server={config.Server};Port={config.Port};Database={database};User Id={config.UserId};Password={config.Password};Timeout=30;";
+        }
+
+        private static SireSetup PromptSireSetup(DbConfig config)
+        {
+            var setup = new SireSetup();
+            var databases = GetDatabases(config);
+            if (databases.Count == 0)
+            {
+                Console.WriteLine("No databases were found. Pawa Sire canceled.");
+                return null;
+            }
+
+            Console.WriteLine("\n--- [Pawa] Sire Setup ---");
+            for (int i = 0; i < databases.Count; i++)
+            {
+                Console.WriteLine($"{i + 1}. {databases[i]}");
+            }
+
+            Console.Write($"Choose the source database [{config.Database}]: ");
+            string sourceInput = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(sourceInput))
+            {
+                setup.SourceDatabase = config.Database;
+            }
+            else if (int.TryParse(sourceInput, out int sourceIndex) && sourceIndex > 0 && sourceIndex <= databases.Count)
+            {
+                setup.SourceDatabase = databases[sourceIndex - 1];
+            }
+            else if (databases.Contains(sourceInput))
+            {
+                setup.SourceDatabase = sourceInput;
+            }
+            else
+            {
+                Console.WriteLine("Invalid source database. Pawa Sire canceled.");
+                return null;
+            }
+
+            Console.Write("New database name: ");
+            setup.NewDatabaseName = Console.ReadLine()?.Trim();
+
+            while (true)
+            {
+                Console.WriteLine("\nReview clone setup:");
+                Console.WriteLine($"Source database: {setup.SourceDatabase}");
+                Console.WriteLine($"New database: {setup.NewDatabaseName}");
+                Console.Write("Enter E to edit, or Y to continue: ");
+                string review = Console.ReadLine()?.Trim().ToUpperInvariant();
+                if (review == "Y") return setup;
+                if (review != "E") continue;
+
+                Console.Write($"Source database [{setup.SourceDatabase}]: ");
+                string value = Console.ReadLine();
+                if (!string.IsNullOrWhiteSpace(value)) setup.SourceDatabase = value.Trim();
+                Console.Write($"New database name [{setup.NewDatabaseName}]: ");
+                value = Console.ReadLine();
+                if (!string.IsNullOrWhiteSpace(value)) setup.NewDatabaseName = value.Trim();
+            }
+        }
+
+        private static int ReadPositiveInteger(string prompt, int defaultValue = 0)
+        {
+            while (true)
+            {
+                Console.Write(prompt);
+                string input = Console.ReadLine();
+                if (string.IsNullOrWhiteSpace(input) && defaultValue > 0) return defaultValue;
+                if (int.TryParse(input, out int value) && value > 0) return value;
+                Console.WriteLine("Enter a whole number greater than zero.");
+            }
+        }
+
+        private static void PawaSire(DbConfig config)
+        {
+            SireSetup setup = PromptSireSetup(config);
+            if (setup == null || string.IsNullOrWhiteSpace(setup.NewDatabaseName))
+            {
+                Console.WriteLine("New database name is required. Pawa Sire canceled.");
+                return;
+            }
+
+            try
+            {
+                using (var adminConnection = new NpgsqlConnection(BuildConnectionString(config, "postgres")))
+                {
+                    adminConnection.Open();
+                    bool sourceConnectionsDisabled = false;
+                    bool sourceAllowedConnections = true;
+                    NpgsqlConnection disconnectConnection = adminConnection;
+                    bool temporaryDisconnectConnection = false;
+
+                    using (var existsCommand = new NpgsqlCommand("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = @name);", adminConnection))
+                    {
+                        existsCommand.Parameters.AddWithValue("name", setup.NewDatabaseName);
+                        if ((bool)existsCommand.ExecuteScalar())
+                        {
+                            Console.WriteLine($"Database '{setup.NewDatabaseName}' already exists. Pawa Sire canceled.");
+                            return;
+                        }
+                    }
+
+                    try
+                    {
+                        using (var allowConnectionsCommand = new NpgsqlCommand("SELECT datallowconn FROM pg_database WHERE datname = @sourceDatabase;", adminConnection))
+                        {
+                            allowConnectionsCommand.Parameters.AddWithValue("sourceDatabase", setup.SourceDatabase);
+                            object result = allowConnectionsCommand.ExecuteScalar();
+                            if (result == null)
+                            {
+                                Console.WriteLine($"Source database '{setup.SourceDatabase}' was not found. Pawa Sire canceled.");
+                                return;
+                            }
+                            sourceAllowedConnections = (bool)result;
+                        }
+
+                        Console.WriteLine($"Blocking new sessions to source database '{setup.SourceDatabase}'...");
+                        using (var blockCommand = new NpgsqlCommand($"ALTER DATABASE {QuoteIdentifier(setup.SourceDatabase)} ALLOW_CONNECTIONS false;", adminConnection))
+                        {
+                            blockCommand.ExecuteNonQuery();
+                            sourceConnectionsDisabled = true;
+                        }
+
+                        Console.WriteLine($"Disconnecting active sessions from source database '{setup.SourceDatabase}'...");
+                        const string terminateSql = @"
+                            SELECT pg_terminate_backend(pid)
+                            FROM pg_stat_activity
+                            WHERE datname = @sourceDatabase
+                              AND pid <> pg_backend_pid();";
+                        try
+                        {
+                            using (var terminateCommand = new NpgsqlCommand(terminateSql, disconnectConnection))
+                            {
+                                terminateCommand.Parameters.AddWithValue("sourceDatabase", setup.SourceDatabase);
+                                terminateCommand.ExecuteNonQuery();
+                            }
+                        }
+                        catch (PostgresException ex) when (ex.SqlState == "42501")
+                        {
+                            Console.WriteLine("The configured user cannot disconnect one or more privileged sessions.");
+                            DbConfig disconnectConfig = PromptDisconnectConfig(config);
+                            if (disconnectConfig == null) throw;
+
+                            disconnectConnection = new NpgsqlConnection(BuildConnectionString(disconnectConfig, "postgres"));
+                            disconnectConnection.Open();
+                            temporaryDisconnectConnection = true;
+
+                            using (var terminateCommand = new NpgsqlCommand(terminateSql, disconnectConnection))
+                            {
+                                terminateCommand.Parameters.AddWithValue("sourceDatabase", setup.SourceDatabase);
+                                terminateCommand.ExecuteNonQuery();
+                            }
+                        }
+
+                        using (var sessionsCommand = new NpgsqlCommand(@"
+                            SELECT COUNT(*)
+                            FROM pg_stat_activity
+                            WHERE datname = @sourceDatabase
+                              AND pid <> pg_backend_pid();", adminConnection))
+                        {
+                            sessionsCommand.Parameters.AddWithValue("sourceDatabase", setup.SourceDatabase);
+                            long activeSessions = (long)sessionsCommand.ExecuteScalar();
+                            if (activeSessions > 0)
+                            {
+                                throw new InvalidOperationException($"Could not disconnect {activeSessions} session(s) from source database '{setup.SourceDatabase}'.");
+                            }
+                        }
+
+                        string cloneSql = $"CREATE DATABASE {QuoteIdentifier(setup.NewDatabaseName)} WITH TEMPLATE {QuoteIdentifier(setup.SourceDatabase)};";
+                        Console.WriteLine($"Cloning '{setup.SourceDatabase}' to '{setup.NewDatabaseName}'...");
+                        using (var cloneCommand = new NpgsqlCommand(cloneSql, adminConnection))
+                        {
+                            cloneCommand.ExecuteNonQuery();
+                        }
+                    }
+                    finally
+                    {
+                        if (sourceConnectionsDisabled)
+                        {
+                            using (var restoreCommand = new NpgsqlCommand($"ALTER DATABASE {QuoteIdentifier(setup.SourceDatabase)} ALLOW_CONNECTIONS {sourceAllowedConnections.ToString().ToLowerInvariant()};", disconnectConnection))
+                            {
+                                restoreCommand.ExecuteNonQuery();
+                            }
+                        }
+
+                        if (temporaryDisconnectConnection)
+                        {
+                            disconnectConnection.Dispose();
+                        }
+                    }
+                }
+
+                Console.WriteLine($"Pawa Sire clone completed. Sample database: {setup.NewDatabaseName}");
+                Console.WriteLine("Transaction reset was not run. Use option 8 when you are ready.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Pawa Sire failed: {ex.Message}");
+            }
+        }
+
+        private static DbConfig PromptDisconnectConfig(DbConfig originalConfig)
+        {
+            Console.WriteLine("\n--- Temporary Disconnect Credentials ---");
+            Console.WriteLine("These credentials are used only to disconnect source-database sessions.");
+            Console.Write($"Server [{originalConfig.Server}]: ");
+            string server = Console.ReadLine();
+            Console.Write($"Port [{originalConfig.Port}]: ");
+            string portInput = Console.ReadLine();
+            Console.Write("Privileged user: ");
+            string user = Console.ReadLine();
+            Console.Write("Privileged password: ");
+            string password = Console.ReadLine();
+
+            if (string.IsNullOrWhiteSpace(user) || string.IsNullOrWhiteSpace(password))
+            {
+                Console.WriteLine("Privileged user and password are required. Disconnect canceled.");
+                return null;
+            }
+
+            var disconnectConfig = new DbConfig
+            {
+                Server = string.IsNullOrWhiteSpace(server) ? originalConfig.Server : server.Trim(),
+                Port = int.TryParse(portInput, out int port) ? port : originalConfig.Port,
+                UserId = user.Trim(),
+                Password = password
+            };
+            return disconnectConfig;
+        }
+
+        private static void TransactionReset(DbConfig config)
+        {
+            string databaseName = PromptDatabaseName(config, "database to reset");
+            if (string.IsNullOrWhiteSpace(databaseName)) return;
+
+            try
+            {
+                using (var databaseConnection = new NpgsqlConnection(BuildConnectionString(config, databaseName)))
+                {
+                    databaseConnection.Open();
+                    bool schemasDeleted = DeleteConfirmedBranchSchemas(databaseConnection);
+                    ResetTypeTableLastNumbers(databaseConnection);
+                    var tables = GetTransactionalTables(databaseConnection);
+                    DisplayPopulatedTables(GetPopulatedTables(databaseConnection));
+                    ReviewCleanupTables(tables);
+
+                    if (tables.Count == 0)
+                    {
+                        if (schemasDeleted) VacuumDatabase(databaseConnection);
+                        Console.WriteLine("No tables selected. Transaction reset canceled.");
+                        return;
+                    }
+
+                    Console.WriteLine("The following tables will be emptied:");
+                    foreach (var table in tables) Console.WriteLine($"- {table.Key} ({table.Value:N0} rows)");
+                    Console.Write("Type RESET to continue: ");
+                    if (!string.Equals(Console.ReadLine()?.Trim(), "RESET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine("Transaction reset canceled.");
+                        return;
+                    }
+
+                    CleanTransactionalTables(databaseConnection, tables);
+                    Console.WriteLine($"Transaction reset completed for '{databaseName}'.");
+                    VacuumDatabase(databaseConnection);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Transaction reset failed: {ex.Message}");
+            }
+        }
+
+        private static void VacuumAnalyze(DbConfig config)
+        {
+            string databaseName = PromptDatabaseName(config, "database to vacuum");
+            if (string.IsNullOrWhiteSpace(databaseName)) return;
+
+            try
+            {
+                using (var databaseConnection = new NpgsqlConnection(BuildConnectionString(config, databaseName)))
+                {
+                    databaseConnection.Open();
+                    VacuumDatabase(databaseConnection);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"VACUUM failed: {ex.Message}");
+            }
+        }
+
+        private static void ShowTableRowCounts(DbConfig config)
+        {
+            string databaseName = PromptDatabaseName(config, "database to inspect");
+            if (string.IsNullOrWhiteSpace(databaseName)) return;
+
+            try
+            {
+                using (var databaseConnection = new NpgsqlConnection(BuildConnectionString(config, databaseName)))
+                {
+                    databaseConnection.Open();
+                    DisplayAllTableRowCounts(GetAllTableRowCounts(databaseConnection));
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Could not read table row counts: {ex.Message}");
+            }
+        }
+
+        private static string PromptDatabaseName(DbConfig config, string purpose)
+        {
+            var databases = GetDatabases(config);
+            if (databases.Count == 0)
+            {
+                Console.WriteLine("No databases were found.");
+                return null;
+            }
+
+            Console.WriteLine($"\nSelect the {purpose}:");
+            for (int i = 0; i < databases.Count; i++) Console.WriteLine($"{i + 1}. {databases[i]}");
+            Console.Write("Enter a number or database name: ");
+            string input = Console.ReadLine()?.Trim();
+            if (int.TryParse(input, out int index) && index > 0 && index <= databases.Count) return databases[index - 1];
+            if (databases.Contains(input)) return input;
+            Console.WriteLine("Invalid database. Operation canceled.");
+            return null;
+        }
+
+        private static bool DeleteConfirmedBranchSchemas(NpgsqlConnection connection)
+        {
+            var schemas = new List<string>();
+            bool deleted = false;
+            const string schemaSql = @"
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name LIKE 'br\_%' ESCAPE '\'
+                ORDER BY schema_name;";
+            using (var command = new NpgsqlCommand(schemaSql, connection))
+            using (var reader = command.ExecuteReader())
+            {
+                while (reader.Read()) schemas.Add(reader.GetString(0));
+            }
+
+            foreach (string schema in schemas)
+            {
+                Console.Write($"Delete schema '{schema}' and all its tables? (y/n): ");
+                if (!string.Equals(Console.ReadLine()?.Trim(), "y", StringComparison.OrdinalIgnoreCase)) continue;
+
+                using (var dropCommand = new NpgsqlCommand($"DROP SCHEMA {QuoteIdentifier(schema)} CASCADE;", connection))
+                {
+                    dropCommand.ExecuteNonQuery();
+                    deleted = true;
+                    Console.WriteLine($"Deleted schema '{schema}'.");
+                }
+            }
+
+            return deleted;
+        }
+
+        private static List<TableInfo> GetPopulatedTables(NpgsqlConnection connection)
+        {
+            var tables = new List<TableInfo>();
+            var candidates = new List<TableInfo>();
+            const string sql = @"
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_type = 'BASE TABLE'
+                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                  AND table_schema NOT LIKE 'pg\_%' ESCAPE '\'
+                ORDER BY table_schema, table_name;";
+            using (var command = new NpgsqlCommand(sql, connection))
+            using (var reader = command.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    candidates.Add(new TableInfo
+                    {
+                        Schema = reader.GetString(0),
+                        Name = reader.GetString(1)
+                    });
+                }
+            }
+
+            foreach (TableInfo table in candidates)
+            {
+                using (var countCommand = new NpgsqlCommand($"SELECT COUNT(*) FROM {QuoteIdentifier(table.Schema)}.{QuoteIdentifier(table.Name)};", connection))
+                {
+                    table.RowCount = (long)countCommand.ExecuteScalar();
+                    if (table.RowCount > 0) tables.Add(table);
+                }
+            }
+            return tables;
+        }
+
+        private static List<TableInfo> GetAllTableRowCounts(NpgsqlConnection connection)
+        {
+            var tables = new List<TableInfo>();
+            const string sql = @"
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_type = 'BASE TABLE'
+                  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                  AND table_schema NOT LIKE 'pg\_%' ESCAPE '\'
+                ORDER BY table_schema, table_name;";
+            using (var command = new NpgsqlCommand(sql, connection))
+            using (var reader = command.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    tables.Add(new TableInfo
+                    {
+                        Schema = reader.GetString(0),
+                        Name = reader.GetString(1)
+                    });
+                }
+            }
+
+            foreach (TableInfo table in tables)
+            {
+                using (var countCommand = new NpgsqlCommand(
+                    $"SELECT COUNT(*) FROM {QuoteIdentifier(table.Schema)}.{QuoteIdentifier(table.Name)};",
+                    connection))
+                {
+                    table.RowCount = (long)countCommand.ExecuteScalar();
+                }
+            }
+
+            return tables;
+        }
+
+        private static void DisplayAllTableRowCounts(List<TableInfo> tables)
+        {
+            Console.WriteLine("\nAll application tables by row count:");
+            Console.WriteLine("+------------------------------+--------------------------------+------------+");
+            Console.WriteLine("| Schema                       | Table                          | Row count  |");
+            Console.WriteLine("+------------------------------+--------------------------------+------------+");
+            foreach (TableInfo table in tables.OrderByDescending(table => table.RowCount).ThenBy(table => table.Schema).ThenBy(table => table.Name))
+            {
+                Console.WriteLine($"| {TrimForTable(table.Schema, 28),-28} | {TrimForTable(table.Name, 30),-30} | {table.RowCount,10:N0} |");
+            }
+            Console.WriteLine("+------------------------------+--------------------------------+------------+");
+            if (tables.Count == 0) Console.WriteLine("No application tables were found.");
+        }
+
+        private static void ResetTypeTableLastNumbers(NpgsqlConnection connection)
+        {
+            var typeTables = new List<TableInfo>();
+            const string sql = @"
+                SELECT DISTINCT c.table_schema, c.table_name
+                FROM information_schema.columns c
+                JOIN information_schema.tables t
+                  ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                WHERE t.table_type = 'BASE TABLE'
+                  AND c.column_name = 'last_number'
+                  AND c.table_name LIKE '%\_type' ESCAPE '\'
+                  AND c.table_schema NOT IN ('pg_catalog', 'information_schema')
+                  AND c.table_schema NOT LIKE 'pg\_%' ESCAPE '\'
+                ORDER BY c.table_schema, c.table_name;";
+            using (var command = new NpgsqlCommand(sql, connection))
+            using (var reader = command.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    typeTables.Add(new TableInfo
+                    {
+                        Schema = reader.GetString(0),
+                        Name = reader.GetString(1)
+                    });
+                }
+            }
+
+            foreach (TableInfo table in typeTables)
+            {
+                Console.Write($"Reset last_number in {table.Schema}.{table.Name}? (y/n): ");
+                if (!string.Equals(Console.ReadLine()?.Trim(), "y", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"Skipped {table.Schema}.{table.Name}.");
+                    continue;
+                }
+
+                using (var updateCommand = new NpgsqlCommand(
+                    $"UPDATE {QuoteIdentifier(table.Schema)}.{QuoteIdentifier(table.Name)} SET {QuoteIdentifier("last_number")} = 0;",
+                    connection))
+                {
+                    int updatedRows = updateCommand.ExecuteNonQuery();
+                    Console.WriteLine($"Reset last_number in {table.Schema}.{table.Name} ({updatedRows:N0} row(s)).");
+                }
+            }
+        }
+
+        private static void DisplayPopulatedTables(List<TableInfo> tables)
+        {
+            Console.WriteLine("\nRemaining tables with data:");
+            Console.WriteLine("+------------------------------+--------------------------------+------------+");
+            Console.WriteLine("| Schema                       | Table                          | Row count  |");
+            Console.WriteLine("+------------------------------+--------------------------------+------------+");
+            foreach (TableInfo table in tables.OrderByDescending(table => table.RowCount).ThenBy(table => table.Schema).ThenBy(table => table.Name))
+            {
+                Console.WriteLine($"| {TrimForTable(table.Schema, 28),-28} | {TrimForTable(table.Name, 30),-30} | {table.RowCount,10:N0} |");
+            }
+            Console.WriteLine("+------------------------------+--------------------------------+------------+");
+            if (tables.Count == 0) Console.WriteLine("No remaining tables contain data.");
+        }
+
+        private static string TrimForTable(string value, int maxLength)
+        {
+            if (value.Length <= maxLength) return value;
+            return value.Substring(0, maxLength - 3) + "...";
+        }
+
+        private static Dictionary<string, long> GetTransactionalTables(NpgsqlConnection connection)
+        {
+            var tables = new Dictionary<string, long>();
+            foreach (TableInfo table in GetPopulatedTables(connection))
+            {
+                string normalized = table.Name.ToLowerInvariant();
+                bool explicitResetTable = IsExplicitResetTable(table.Schema, normalized);
+                 if ((table.Schema.Equals("cb", StringComparison.OrdinalIgnoreCase) &&
+                     normalized.Equals("ledger", StringComparison.Ordinal)) ||
+                    (table.Schema.Equals("public", StringComparison.OrdinalIgnoreCase) &&
+                     normalized.Equals("m_payments", StringComparison.Ordinal))) continue;
+
+                if (table.Name.Equals("branch", StringComparison.OrdinalIgnoreCase) ||
+                    (!explicitResetTable && (normalized.Contains("master") || normalized.Contains("config") ||
+                    normalized.Contains("setting") || normalized.Contains("reference") ||
+                    normalized.Contains("lookup") || normalized.Contains("till")))) continue;
+                if (normalized.EndsWith("_type", StringComparison.Ordinal)) continue;
+
+                if (explicitResetTable || normalized == "pl_trans_details" || normalized == "stock_pic" ||
+                    normalized == "stock_loc" || normalized == "upd_log" ||
+                    normalized.EndsWith("_log", StringComparison.Ordinal) ||
+                    normalized.Contains("_trans") || normalized.Contains("st_") ||
+                    normalized.Contains("transaction") || normalized.Contains("sale") ||
+                    normalized.Contains("payment") || normalized.Contains("receipt") ||
+                    normalized.Contains("invoice") || normalized.Contains("order") ||
+                    normalized.Contains("ledger") || normalized.Contains("journal") ||
+                    normalized.Contains("audit") || normalized.Contains("session") ||
+                    normalized.Contains("mpesa"))
+                {
+                    tables[$"{table.Schema}.{table.Name}"] = table.RowCount;
+                }
+            }
+
+            return tables;
+        }
+
+        private static bool IsExplicitResetTable(string schema, string normalizedTableName)
+        {
+            if (schema.Equals("promo", StringComparison.OrdinalIgnoreCase) && normalizedTableName == "promo_master") return true;
+
+            return normalizedTableName == "cheque_iss" || normalizedTableName == "cheque_rec" ||
+                normalizedTableName == "banking_summary" || normalizedTableName == "user_permission_details" ||
+                normalizedTableName == "till_trans" || normalizedTableName == "till_trans_details" ||
+                normalizedTableName == "till_payment_details" || normalizedTableName == "zed" ||
+                normalizedTableName == "eod" || normalizedTableName == "price_hist" ||
+                normalizedTableName == "hq_user" || normalizedTableName == "hq_operator" ||
+                normalizedTableName == "m_eod" || normalizedTableName == "credit_notes" ||
+                normalizedTableName == "deposits";
+        }
+
+        private static void ReviewCleanupTables(Dictionary<string, long> tables)
+        {
+            if (tables.Count == 0)
+            {
+                Console.WriteLine("No transaction-like tables were detected. No tables will be cleaned.");
+                return;
+            }
+
+            var selected = new Dictionary<string, long>();
+            Console.WriteLine("\nSelect transaction tables one by one:");
+            foreach (var table in tables.ToList())
+            {
+                Console.Write($"Reset '{table.Key}' ({table.Value:N0} rows)? (y/n): ");
+                if (string.Equals(Console.ReadLine()?.Trim(), "y", StringComparison.OrdinalIgnoreCase))
+                {
+                    selected[table.Key] = table.Value;
+                }
+            }
+
+            tables.Clear();
+            foreach (var table in selected) tables[table.Key] = table.Value;
+        }
+
+        private static void EnsureBranchTable(NpgsqlConnection connection)
+        {
+            const string sql = @"
+                CREATE TABLE IF NOT EXISTS public.branch (
+                    branch_id integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    branch_name text NOT NULL,
+                    branch_number text NOT NULL UNIQUE,
+                    mpesa_till_number text,
+                    number_of_tills integer NOT NULL DEFAULT 1,
+                    created_at timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );";
+            using (var command = new NpgsqlCommand(sql, connection)) command.ExecuteNonQuery();
+        }
+
+        private static void InsertBranchSetup(NpgsqlConnection connection, SireSetup setup)
+        {
+            const string sql = @"
+                INSERT INTO public.branch (branch_name, branch_number, mpesa_till_number, number_of_tills)
+                VALUES (@branchName, @branchNumber, @mpesaTill, @numberOfTills);";
+            using (var command = new NpgsqlCommand(sql, connection))
+            {
+                command.Parameters.AddWithValue("branchName", setup.BranchName);
+                command.Parameters.AddWithValue("branchNumber", setup.BranchNumber);
+                command.Parameters.AddWithValue("mpesaTill", (object)setup.MpesaTillNumber ?? DBNull.Value);
+                command.Parameters.AddWithValue("numberOfTills", setup.NumberOfTills);
+                command.ExecuteNonQuery();
+            }
+        }
+
+        private static void CleanTransactionalTables(NpgsqlConnection connection, Dictionary<string, long> tables)
+        {
+            if (tables.Count == 0) return;
+            foreach (string table in tables.Keys)
+            {
+                int separator = table.IndexOf('.');
+                string schema = table.Substring(0, separator);
+                string name = table.Substring(separator + 1);
+                string qualifiedTable = QuoteIdentifier(schema) + "." + QuoteIdentifier(name);
+                try
+                {
+                    if (name.Equals("user_permission_details", StringComparison.OrdinalIgnoreCase))
+                    {
+                        DeleteNonProtectedPermissionDetails(connection, schema, qualifiedTable);
+                    }
+                    else
+                    {
+                        string sql = $"TRUNCATE TABLE {qualifiedTable} RESTART IDENTITY;";
+                        using (var command = new NpgsqlCommand(sql, connection)) command.ExecuteNonQuery();
+                    }
+                    Console.WriteLine($"Reset {table}.");
+                }
+                catch (PostgresException ex) when (ex.SqlState == "P0001")
+                {
+                    Console.WriteLine($"Skipped {table}: the table is append-only and rejected the reset.");
+                }
+            }
+        }
+
+        private static void DeleteNonProtectedPermissionDetails(NpgsqlConnection connection, string schema, string qualifiedTable)
+        {
+            string columnName = null;
+            const string columnSql = @"
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = @schema AND table_name = 'user_permission_details'
+                  AND column_name IN ('branch_user_id', 'user_id')
+                ORDER BY CASE column_name WHEN 'branch_user_id' THEN 1 ELSE 2 END
+                LIMIT 1;";
+            using (var columnCommand = new NpgsqlCommand(columnSql, connection))
+            {
+                columnCommand.Parameters.AddWithValue("schema", schema);
+                columnName = columnCommand.ExecuteScalar() as string;
+            }
+
+            if (columnName == null)
+            {
+                Console.WriteLine($"Skipped {qualifiedTable}: no branch_user_id or user_id column was found.");
+                return;
+            }
+
+            string deleteSql = $"DELETE FROM {qualifiedTable} WHERE {QuoteIdentifier(columnName)}::text <> @protectedUserId;";
+            using (var deleteCommand = new NpgsqlCommand(deleteSql, connection))
+            {
+                deleteCommand.Parameters.AddWithValue("protectedUserId", "0099");
+                deleteCommand.ExecuteNonQuery();
+            }
+        }
+
+        private static void VacuumDatabase(NpgsqlConnection connection)
+        {
+            Console.WriteLine("Running VACUUM (FREEZE, ANALYZE, VERBOSE)...");
+            connection.Notice += (sender, args) => Console.WriteLine(args.Notice.MessageText);
+            using (var command = new NpgsqlCommand("VACUUM (FREEZE, ANALYZE, VERBOSE);", connection))
+            {
+                command.ExecuteNonQuery();
+            }
+            Console.WriteLine("Vacuum completed.");
         }
 
         public static List<string> GetDatabases(DbConfig config)
