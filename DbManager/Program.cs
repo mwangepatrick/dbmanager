@@ -354,6 +354,10 @@ namespace DbManager
                     Console.WriteLine("9. [Pawa] VACUUM/FREEZE/ANALYZE");
                     Console.WriteLine("10. [Pawa] Show table row counts");
                     Console.WriteLine("11. Go back to main menu");
+                    if (!IsLocalServer(config.Server))
+                    {
+                        Console.WriteLine("12. [Pawa] Pull remote database to local (dump + restore under same name)");
+                    }
                     Console.WriteLine("X. Exit");
                     Console.Write("Enter your choice: ");
 
@@ -400,6 +404,12 @@ namespace DbManager
                             break;
                         case "11":
                             backToConnections = true;
+                            break;
+                        case "12":
+                            if (IsLocalServer(config.Server))
+                                Console.WriteLine("Invalid choice. Please try again.");
+                            else
+                                PullRemoteToLocal(config);
                             break;
                         case "X":
                             return;
@@ -1502,6 +1512,248 @@ namespace DbManager
             catch (Exception ex)
             {
                 Console.WriteLine($"An error occurred during backup: {ex.Message}");
+            }
+        }
+
+        private static bool IsLocalServer(string server)
+        {
+            if (string.IsNullOrWhiteSpace(server)) return false;
+            string s = server.Trim().ToLowerInvariant();
+            return s == "localhost" || s == "127.0.0.1" || s == "::1" || s == "[::1]";
+        }
+
+        private static DbConfig SelectLocalTarget()
+        {
+            var localConfigs = LoadConfigs().Where(c => IsLocalServer(c.Server)).ToList();
+            if (localConfigs.Count > 0)
+            {
+                Console.WriteLine("\nLocal target connections:");
+                for (int i = 0; i < localConfigs.Count; i++)
+                {
+                    Console.WriteLine($"{i + 1}: {localConfigs[i].Name} ({localConfigs[i].Server}:{localConfigs[i].Port})");
+                }
+                Console.WriteLine("N: Enter a new local connection");
+                Console.Write("Select the local target [1]: ");
+                string input = Console.ReadLine()?.Trim();
+                if (string.IsNullOrEmpty(input)) return localConfigs[0];
+                if (int.TryParse(input, out int index) && index >= 1 && index <= localConfigs.Count)
+                    return localConfigs[index - 1];
+                if (!input.Equals("N", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine("Invalid choice.");
+                    return null;
+                }
+            }
+
+            var local = new DbConfig { Name = "Local", Server = "localhost", Database = "postgres", Port = 5432 };
+            Console.Write("Local user ID [postgres]: ");
+            string user = Console.ReadLine();
+            local.UserId = string.IsNullOrWhiteSpace(user) ? "postgres" : user.Trim();
+            Console.Write("Local password: ");
+            local.Password = Console.ReadLine();
+            local.Port = ReadPositiveInteger("Local port [5432]: ", 5432);
+
+            if (!TestConnection(local)) return null;
+
+            Console.Write("Save this as a connection for next time? (y/n): ");
+            if (Console.ReadLine()?.Trim().ToLowerInvariant() == "y")
+            {
+                var all = LoadConfigs();
+                all.Add(local);
+                SaveConfigs(all);
+            }
+            return local;
+        }
+
+        // Runs a CLI tool, streaming its output. Returns the exit code.
+        private static int RunTool(string fileName, IEnumerable<string> arguments, DbConfig config,
+            string extraPgOptions = null)
+        {
+            var info = new ProcessStartInfo(fileName)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            foreach (string arg in arguments) info.ArgumentList.Add(arg);
+            info.EnvironmentVariables["PGPASSWORD"] = config.Password;
+            if (extraPgOptions != null) info.EnvironmentVariables["PGOPTIONS"] = extraPgOptions;
+
+            using (var proc = new Process { StartInfo = info })
+            {
+                proc.OutputDataReceived += (s, d) => { if (!string.IsNullOrEmpty(d.Data)) Console.WriteLine(d.Data); };
+                proc.ErrorDataReceived += (s, d) => { if (!string.IsNullOrEmpty(d.Data)) Console.WriteLine(d.Data); };
+                proc.Start();
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                proc.WaitForExit();
+                return proc.ExitCode;
+            }
+        }
+
+        private static bool LocalDatabaseExists(NpgsqlConnection adminConnection, string databaseName)
+        {
+            using (var command = new NpgsqlCommand("SELECT 1 FROM pg_database WHERE datname = @name", adminConnection))
+            {
+                command.Parameters.AddWithValue("name", databaseName);
+                return command.ExecuteScalar() != null;
+            }
+        }
+
+        private static void DisconnectLocalUsers(NpgsqlConnection adminConnection, string databaseName)
+        {
+            const string sql = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity " +
+                               "WHERE datname = @name AND pid <> pg_backend_pid()";
+            using (var command = new NpgsqlCommand(sql, adminConnection))
+            {
+                command.Parameters.AddWithValue("name", databaseName);
+                command.ExecuteNonQuery();
+            }
+        }
+
+        // Pulls a database from a remote (non-local) server and restores it locally under the same name.
+        // The remote is only ever read (pg_dump); every write happens on the local server.
+        public static void PullRemoteToLocal(DbConfig remote)
+        {
+            try
+            {
+                if (IsLocalServer(remote.Server))
+                {
+                    Console.WriteLine("This option is only for remote connections. Use Backup/Import for local servers.");
+                    return;
+                }
+
+                DbConfig local = SelectLocalTarget();
+                if (local == null)
+                {
+                    Console.WriteLine("No local target selected. Operation canceled.");
+                    return;
+                }
+
+                Console.Write($"Remote database to pull [{remote.Database}]: ");
+                string dbName = Console.ReadLine()?.Trim();
+                if (string.IsNullOrEmpty(dbName)) dbName = remote.Database;
+                if (string.IsNullOrWhiteSpace(dbName) || dbName.Any(c => char.IsControl(c) || c == '"'))
+                {
+                    Console.WriteLine("Invalid database name. Operation canceled.");
+                    return;
+                }
+
+                int jobs = ReadPositiveInteger(
+                    $"Parallel jobs for dump/restore [{Math.Min(4, Environment.ProcessorCount)}] (each dump job opens a connection to the remote): ",
+                    Math.Min(4, Environment.ProcessorCount));
+
+                Console.WriteLine(
+                    $"\nPull '{dbName}' from {remote.Server}:{remote.Port} (read-only) into {local.Server}:{local.Port} as '{dbName}'.");
+                Console.Write("Continue? (yes/no): ");
+                if (Console.ReadLine()?.Trim().ToLowerInvariant() != "yes")
+                {
+                    Console.WriteLine("Canceled.");
+                    return;
+                }
+
+                // 1. Dump the remote first, so the local database is untouched if the dump fails.
+                // Directory format allows parallel dump and parallel restore; -Z 3 trades a little size for speed.
+                string safeConfigName = string.Join("_", remote.Name.Split(Path.GetInvalidFileNameChars()));
+                string dumpDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "backups", safeConfigName,
+                    $"{dbName}_{DateTime.Now:yyMMddHHmmss}.dumpdir");
+                Directory.CreateDirectory(Path.GetDirectoryName(dumpDir));
+
+                Console.WriteLine($"\nDumping remote database to {dumpDir} ...");
+                var stopwatch = Stopwatch.StartNew();
+                int dumpExit = RunTool("pg_dump", new[]
+                {
+                    "-h", remote.Server, "-p", remote.Port.ToString(), "-U", remote.UserId,
+                    "-F", "d", "-j", jobs.ToString(), "-Z", "3", "--no-owner", "--no-acl", "-v",
+                    "-f", dumpDir, dbName
+                }, remote);
+                if (dumpExit != 0)
+                {
+                    Console.WriteLine($"\nDump failed with exit code {dumpExit}. Local server was not touched.");
+                    return;
+                }
+                Console.WriteLine($"Dump completed in {stopwatch.Elapsed:hh\\:mm\\:ss}.");
+
+                // 2. Prepare the local server: rename or drop an existing database with the same name.
+                string adminConnectionString =
+                    $"Server={local.Server};Port={local.Port};Database=postgres;User Id={local.UserId};Password={local.Password};Timeout=30;";
+                using (var admin = new NpgsqlConnection(adminConnectionString))
+                {
+                    admin.Open();
+
+                    if (LocalDatabaseExists(admin, dbName))
+                    {
+                        Console.WriteLine($"\nLocal database '{dbName}' already exists.");
+                        Console.Write("[R]ename it to a timestamped name (default) or [D]rop it? (R/D): ");
+                        string choice = Console.ReadLine()?.Trim().ToUpperInvariant();
+
+                        DisconnectLocalUsers(admin, dbName);
+                        if (choice == "D")
+                        {
+                            Console.Write($"Type the database name '{dbName}' to confirm the drop: ");
+                            if (Console.ReadLine()?.Trim() != dbName)
+                            {
+                                Console.WriteLine($"Confirmation did not match. Canceled; the dump is kept at {dumpDir}.");
+                                return;
+                            }
+                            using (var drop = new NpgsqlCommand($"DROP DATABASE {QuoteIdentifier(dbName)}", admin))
+                            {
+                                drop.ExecuteNonQuery();
+                            }
+                            Console.WriteLine($"Dropped local database '{dbName}'.");
+                        }
+                        else
+                        {
+                            string renamed = $"{dbName}_{DateTime.Now:yyMMddHHmmss}";
+                            using (var rename = new NpgsqlCommand(
+                                $"ALTER DATABASE {QuoteIdentifier(dbName)} RENAME TO {QuoteIdentifier(renamed)}", admin))
+                            {
+                                rename.ExecuteNonQuery();
+                            }
+                            Console.WriteLine($"Renamed existing local database to '{renamed}'.");
+                        }
+                    }
+
+                    using (var create = new NpgsqlCommand($"CREATE DATABASE {QuoteIdentifier(dbName)}", admin))
+                    {
+                        create.ExecuteNonQuery();
+                    }
+                    Console.WriteLine($"Created local database '{dbName}'.");
+                }
+
+                // 3. Restore in parallel. synchronous_commit=off is safe here: the database is brand new and
+                // can be rebuilt from the dump, and it avoids a WAL flush per transaction.
+                Console.WriteLine("\nRestoring locally ...");
+                stopwatch.Restart();
+                int restoreExit = RunTool("pg_restore", new[]
+                {
+                    "-h", local.Server, "-p", local.Port.ToString(), "-U", local.UserId,
+                    "-d", dbName, "-j", jobs.ToString(), "--no-owner", "--no-acl", "-v", dumpDir
+                }, local, "-c synchronous_commit=off");
+
+                Console.WriteLine($"\nRestore finished in {stopwatch.Elapsed:hh\\:mm\\:ss} with exit code {restoreExit}.");
+                if (restoreExit != 0)
+                {
+                    Console.WriteLine("pg_restore reported errors (often missing extensions or roles). Review the output above.");
+                }
+                Console.WriteLine($"Local database '{dbName}' is ready on {local.Server}:{local.Port}.");
+
+                Console.Write($"Delete the dump at {dumpDir}? (y/n) [n]: ");
+                if (Console.ReadLine()?.Trim().ToLowerInvariant() == "y")
+                {
+                    Directory.Delete(dumpDir, true);
+                    Console.WriteLine("Dump deleted.");
+                }
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                Console.WriteLine("'pg_dump' or 'pg_restore' was not found. Install PostgreSQL client tools and add the bin folder to PATH.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"An error occurred while pulling the remote database: {ex.Message}");
             }
         }
 
