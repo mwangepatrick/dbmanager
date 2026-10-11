@@ -1567,7 +1567,7 @@ namespace DbManager
 
         // Runs a CLI tool, streaming its output. Returns the exit code.
         private static int RunTool(string fileName, IEnumerable<string> arguments, DbConfig config,
-            string extraPgOptions = null)
+            string extraPgOptions = null, string progressDirectory = null)
         {
             var info = new ProcessStartInfo(fileName)
             {
@@ -1587,7 +1587,20 @@ namespace DbManager
                 proc.Start();
                 proc.BeginOutputReadLine();
                 proc.BeginErrorReadLine();
-                proc.WaitForExit();
+
+                // Heartbeat so a quiet dump (big table, or waiting on a lock) is distinguishable from a hung one.
+                using (var heartbeat = progressDirectory == null
+                    ? null
+                    : new System.Threading.Timer(_ =>
+                    {
+                        long bytes = Directory.Exists(progressDirectory)
+                            ? new DirectoryInfo(progressDirectory).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length)
+                            : 0;
+                        Console.WriteLine($"[progress] {bytes / (1024.0 * 1024.0):N1} MB written so far");
+                    }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10)))
+                {
+                    proc.WaitForExit();
+                }
                 return proc.ExitCode;
             }
         }
@@ -1640,9 +1653,33 @@ namespace DbManager
                     return;
                 }
 
-                int jobs = ReadPositiveInteger(
-                    $"Parallel jobs for dump/restore [{Math.Min(4, Environment.ProcessorCount)}] (each dump job opens a connection to the remote): ",
+                // The remote is assumed to be production: default to a single dump connection. Restore is local, so it can fan out.
+                int dumpJobs = ReadPositiveInteger(
+                    "Parallel dump jobs on the REMOTE [1] (each job holds a connection and table locks on the live server): ", 1);
+                int restoreJobs = ReadPositiveInteger(
+                    $"Parallel restore jobs on the LOCAL server [{Math.Min(4, Environment.ProcessorCount)}]: ",
                     Math.Min(4, Environment.ProcessorCount));
+
+                // Refuse to start if the dump would leave the remote short of connection slots.
+                const int RequiredSpareSlots = 10;
+                string remoteConnectionString =
+                    $"Server={remote.Server};Port={remote.Port};Database={dbName};User Id={remote.UserId};Password={remote.Password};Timeout=15;Pooling=false;";
+                using (var probe = new NpgsqlConnection(remoteConnectionString))
+                {
+                    probe.Open();
+                    const string slotSql =
+                        "SELECT current_setting('max_connections')::int - current_setting('superuser_reserved_connections')::int " +
+                        "- (SELECT count(*) FROM pg_stat_activity)";
+                    int freeSlots = Convert.ToInt32(new NpgsqlCommand(slotSql, probe).ExecuteScalar());
+                    int needed = dumpJobs + 1; // workers + coordinator
+                    Console.WriteLine($"Remote has {freeSlots} free connection slots; the dump needs {needed}.");
+                    if (freeSlots - needed < RequiredSpareSlots)
+                    {
+                        Console.WriteLine(
+                            $"Aborted: the dump would leave fewer than {RequiredSpareSlots} spare slots on the remote server. Reduce the dump jobs or free connections and retry.");
+                        return;
+                    }
+                }
 
                 Console.WriteLine(
                     $"\nPull '{dbName}' from {remote.Server}:{remote.Port} (read-only) into {local.Server}:{local.Port} as '{dbName}'.");
@@ -1666,9 +1703,9 @@ namespace DbManager
                 int dumpExit = RunTool("pg_dump", new[]
                 {
                     "-h", remote.Server, "-p", remote.Port.ToString(), "-U", remote.UserId,
-                    "-F", "d", "-j", jobs.ToString(), "-Z", "3", "--no-owner", "--no-acl", "-v",
-                    "-f", dumpDir, dbName
-                }, remote);
+                    "-F", "d", "-j", dumpJobs.ToString(), "-Z", "3", "--no-owner", "--no-acl", "-v",
+                    "--lock-wait-timeout=30s", "-f", dumpDir, dbName
+                }, remote, progressDirectory: dumpDir);
                 if (dumpExit != 0)
                 {
                     Console.WriteLine($"\nDump failed with exit code {dumpExit}. Local server was not touched.");
@@ -1730,7 +1767,7 @@ namespace DbManager
                 int restoreExit = RunTool("pg_restore", new[]
                 {
                     "-h", local.Server, "-p", local.Port.ToString(), "-U", local.UserId,
-                    "-d", dbName, "-j", jobs.ToString(), "--no-owner", "--no-acl", "-v", dumpDir
+                    "-d", dbName, "-j", restoreJobs.ToString(), "--no-owner", "--no-acl", "-v", dumpDir
                 }, local, "-c synchronous_commit=off");
 
                 Console.WriteLine($"\nRestore finished in {stopwatch.Elapsed:hh\\:mm\\:ss} with exit code {restoreExit}.");
